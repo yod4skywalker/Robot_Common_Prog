@@ -14,18 +14,20 @@ MODULE PLC_Data
     VAR num HomeSequenceTimeout := 45; ! seconds
     VAR bool trapConnected := FALSE;
     
-	VAR iodev logFile;
+	! Timer persistent values
+    PERS num nCycleCount := 10;
+    PERS num nLastPly := 0; 
     PERS string logFilePath := "/process_times.txt";
-	PERS num nCycleCount := 37;
-	! Clocks for timing
-    VAR clock clkCourse;
-    VAR clock clkPly;
-    VAR num nLastPly := 0; ! Tracks when the ply number changes
+	
+	! Timer variable values
+    VAR clock clkCourse;    ! Total time from Temp_Offset to end of Cut
+    VAR clock clkPly;       ! Total time for the entire Ply
+    VAR iodev logFile;
 	
     PROC LogToFile(string msg)
         VAR iodev logFile;
         Open "HOME:" + logFilePath, logFile \Append;
-        Write logFile, CDate() + " " + CTime() + " | Cycle:" + NumToStr(nCycleCount, 0) + " | " + msg;
+        Write logFile, CDate() + " " + CTime() + " | " + msg;
         Close logFile;
     ERROR
         IF ERRNO = ERR_FILEACC THEN
@@ -43,7 +45,7 @@ MODULE PLC_Data
         Reset Rbt_PreAlignPos;
         Reset Rbt_Home;
         Reset out_CourseFin;
-        !Reset Rbt_KnifeServiceReady;
+        Reset Rbt_KnifeServiceReady;
         eRobotState := defineRobotStates();
         currentPlcState := RequestedPlcState;
         IF NOT trapConnected THEN
@@ -62,27 +64,37 @@ MODULE PLC_Data
     
     
     PROC Temp_Offset(robtarget Offset_name, PERS wobjdata work_objrep)
-        VAR clock c;
+		VAR clock cLocal;
         VAR num dt;
-        VAR string logMsg;
-		
-        VAR robtarget rel_move;
-    
+        VAR string logHeader;
+
+            ! Ply timing logic
+            IF RequestedPly <> nLastPly THEN
+                ClkReset clkPly;
+                ClkStart clkPly;
+                nLastPly := RequestedPly;
+                LogToFile ">>>> STARTING PLY " + NumToStr(RequestedPly, 0);
+            ENDIF
+
+		logHeader := "Ply:" + NumToStr(RequestedPly, 0) + " C:" + NumToStr(RequestedCourse, 0);
         MoveL RelTool(Offset_name, x1_off, y1_off, z1_off), v500, fine, RTSHeadTool\WObj:=work_objrep;
-    
+		
         IF Dry_Run = LOW THEN
             SetDO Rbt_PreAlignPos, HIGH;
     
-            IF gPerfEnable THEN
-                ClkReset c;
-                ClkStart c;
-            ENDIF
+			IF gPerfEnable THEN
+				! Course timer
+				ClkReset clkCourse;
+				ClkStart clkCourse;
+				
+				! Local timer
+				ClkReset cLocal;
+				ClkStart cLocal;
+			ENDIF
     
             WHILE TRUE DO
-    
                 ! Wait for either success OR retry request
                 WaitUntil (PLC_AlignComp = HIGH) OR (Rbt_RetryPreAlign = HIGH);
-    
                 ! Success
                 IF PLC_AlignComp = HIGH THEN
                     Reset Rbt_PreAlignPos;
@@ -91,8 +103,6 @@ MODULE PLC_Data
     
                 ! Retry requested:
                 Reset Rbt_PreAlignPos;
-    
-                ! Move 10mm
                 rel_move := RelTool(CRobT(), -10, 0, 0);
                 MoveL rel_move, v100, fine, RTSHeadTool\WObj:=work_objrep;
     
@@ -100,27 +110,15 @@ MODULE PLC_Data
     
                 ! Wait for PLC to acknowledge and clear retry request
                 WaitUntil Rbt_RetryPreAlign = LOW;
-    
             ENDWHILE
         ENDIF
-    
     ready:
     
-        IF gPerfEnable THEN
-            ClkStop c;
-            dt := ClkRead(c);
-        
-            logMsg := "Pre-position took: " + NumToStr(dt,2) + " s";
-        
-            TPWrite logMsg;
-            LogToFile logMsg;
+		IF gPerfEnable THEN
+            ClkStop cLocal;
+            dt := ClkRead(cLocal);
+            LogToFile logHeader + " | Pre-pos: " + NumToStr(dt, 2) + "s";
         ENDIF
-        
-        !IF gPerfEnable THEN
-        !    ClkStop c;
-        !    dt := ClkRead(c);
-        !    TPWrite "Pre-position took: " + NumToStr(dt, 2) + " s";
-        !ENDIF
     ENDPROC
 
 
@@ -138,15 +136,17 @@ MODULE PLC_Data
     ENDPROC
     
     PROC CutProcess(robtarget Offset_name, num cut_angle, PERS wobjdata work_objrep)
-		! Timer again
-        VAR clock c;
-        VAR num dt;
-        VAR string logMsg;
+		VAR clock cCut; ! Local timer for the cut movement
+        VAR num dtCut;
+        VAR num dtTotalCourse;
+        VAR string logBase;
 		
 		VAR E_RobotState eRobotState;
-        VAR num robotState;        
-        
-        eRobotState := defineRobotStates();
+        VAR num robotState;
+		eRobotState := defineRobotStates();
+		
+		logBase := "Ply:" + NumToStr(RequestedPly, 0) + " C:" + NumToStr(RequestedCourse, 0);
+		
         IF Dry_Run = HIGH THEN			
             SETDO out_CourseFin, HIGH;
             MoveL RelTool(Offset_name, -53, 0, 0),v100,fine,RTSHeadTool\WObj:=work_objrep;       !-53 in x
@@ -159,16 +159,10 @@ MODULE PLC_Data
         ELSE
 			nCycleCount := nCycleCount + 1;
 
-            IF RequestedPly <> nLastPly THEN
-                ClkReset clkPly;
-                ClkStart clkPly;
-                nLastPly := RequestedPly;
-                LogToFile "--- Starting Ply " + NumToStr(RequestedPly, 0) + " ---";
-            ENDIF
-			
-			IF gPerfEnable THEN
-                ClkReset clkCourse;
-                ClkStart clkCourse;
+            ! Start timer for the cut movement specifically
+            IF gPerfEnable THEN
+                ClkReset cCut;
+                ClkStart cCut;
             ENDIF
 			
             SetGO RequestedCutAngle, cut_angle;
@@ -188,7 +182,6 @@ MODULE PLC_Data
             WaitDI in_CutComplete, 1;
             PathAccLim TRUE\AccMax:=0.5, TRUE\DecelMax:=0.2;
             MoveL RelTool(Offset_name, -263, 0, -200),v500,z10,RTSHeadTool\WObj:=work_objrep;   !-210 in x 150 for low cut
-            !robotState := ChangeToState(eRobotState.FinishCourse, defaultStateChangeTimeout);
             MoveL RelTool(Offset_name, -263, 0, -265),v600,z10,RTSHeadTool\WObj:=work_objrep;   !-100 in z (was -274)
             robotState := ChangeToState(eRobotState.FinishCourse, defaultStateChangeTimeout);
             robotState := ChangeToState(eRobotState.Idle, defaultStateChangeTimeout);
@@ -196,24 +189,18 @@ MODULE PLC_Data
             MoveL RelTool(Offset_name, -63, 0, -265),v600,z50,RTSHeadTool\WObj:=work_objrep;    !200 in x (was -274)
         ENDIF
         
-        IF gPerfEnable THEN
-            ClkStop clkCourse;
-            dt := ClkRead(clkCourse);
-            logMsg := "Ply:" + NumToStr(RequestedPly, 0) + " C:" + NumToStr(RequestedCourse, 0) + " | Course Time: " + NumToStr(dt, 2) + "s";
-            
-            TPWrite logMsg;
-            LogToFile logMsg;
-        ENDIF
-!        IF gPerfEnable THEN
-!            ClkStop c;
-!            dt := ClkRead(c);
-!            TPWrite "Cut took: " + NumToStr(dt, 2) + " s";
-!        ENDIF
-    ENDPROC
-
-    PROC ResetProductionStats()
-        nCycleCount := 0;
-        TPWrite "Production counter reset to 0.";
+			IF gPerfEnable THEN
+                ! Timers stopped
+                ClkStop cCut;
+                ClkStop clkCourse;
+                
+                dtCut := ClkRead(cCut);
+                dtTotalCourse := ClkRead(clkCourse);
+                
+                ! Log detailed breakdown
+                LogToFile logBase + " | Cut Time: " + NumToStr(dtCut, 2) + "s";
+                LogToFile logBase + " | TOTAL COURSE TIME: " + NumToStr(dtTotalCourse, 2) + "s";
+            ENDIF
     ENDPROC
     
     PROC main()     
@@ -221,8 +208,8 @@ MODULE PLC_Data
         IF LoadPreformProgram = 1 THEN
             SetDO PreformProgramLoaded, low;
             LoadProgram "PreformProgTemplateV1";
-!        ELSEIF KnifeServiceRequest = 1 THEN
-!            KnifeService;
+        ELSEIF KnifeServiceRequest = 1 THEN
+            KnifeService;
         ElSEIF Load_Lift = 1 THEN
             LiftHead;
             WaitUntil out_NOTRbtTable = high;
@@ -238,25 +225,9 @@ MODULE PLC_Data
             ELSE
                 ! DO NOT DELETE
                 SelectCourse_Ply(RequestedPly), (RequestedCourse);
-				IF RequestedCourse = 80 THEN
-                    ClkStop clkPly;
-                    LogToFile ">>> FINISHED PLY " + NumToStr(RequestedPly, 0) + " | Total Time: " + NumToStr(ClkRead(clkPly), 1) + "s";
-                ENDIF
             ENDIF
         ENDIF
     ENDPROC
-    
-!    PROC LoadProgram(string filename)
-!        VAR string filepath;
-!        filepath := "/hd0a/7600-107413/HOME/" + filename + ".mod";
-!        IF NOT ModExist(filename) THEN
-!            Load filepath;
-!        ELSE
-!            EraseModule filename;
-!            Load filepath;
-!        ENDIF
-!        SetDO PreformProgramLoaded, high;
-!    ENDPROC
 
 
     PROC LoadProgram(string filename)
